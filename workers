@@ -1,10 +1,14 @@
-// Cloudflare Worker：Telegram 双向机器人 + 优化版自动点赞 + 极简体验
-// 核心优化：
-// 1. 所有自动点赞统一使用🕊表情符号
-// 2. 编辑消息时先显示🦄，1秒后改为🕊
-// 3. 移除所有转发按钮，保持话题原生体验
-// 4. 仅首次创建话题显示用户信息，无任何冗余提示
-// 5. 验证提示隐藏原始链接，简化语言；验证界面移除多余提示；重置验证不通知用户
+/**
+ * Telegram 双向机器人 (Cloudflare Worker 实现)
+ * 核心功能概述：
+ * 1. 双向消息转发：用户私聊消息 ↔ 超级群组话题，支持文本/图片/视频/文档等媒体类型
+ * 2. 智能自动点赞：统一使用🕊表情点赞，编辑消息时先显示🦄，1秒后自动切换为🕊
+ * 3. 安全验证机制：基于Cloudflare Turnstile的人机验证，隐藏原始链接，简化验证流程
+ * 4. 话题管理：自动为每个用户创建专属话题，名称格式为@用户名(用户ID)，仅首次显示用户信息
+ * 5. 管理员功能：支持用户信息查看、验证重置、对话开关、封禁/解封、验证有效期设置等指令
+ * 6. 极简体验：移除转发按钮，隐藏冗余提示，重置验证不通知用户，保持Telegram原生交互体验
+ * 7. 健壮性保障：完善的错误处理、重试机制、超时控制，支持健康检查接口
+ */
 
 export default {
   async fetch(request, env, ctx) {
@@ -554,11 +558,14 @@ async function getOrCreateTopicId(userId, env, userName, userUsername) {
 
   if (topicId) return Number(topicId);
 
-  // 首次创建话题
+  // 首次创建话题 - 优化：固定话题名称格式为 @用户名(用户ID)
   userName = userName || (await getUserName(userId, env));
+  // 格式化话题名称：优先用@用户名，无则用昵称
+  const topicName = userUsername ? `${userUsername}(${userId})` : `${userName}(${userId})`;
+  
   const createResult = await tgApiCall(env, "createForumTopic", {
     chat_id: env.SUPERGROUP_ID,
-    name: `用户 ${userName} (ID: ${userId})`
+    name: topicName // 使用格式化后的名称
   });
 
   if (createResult.ok) {
@@ -717,12 +724,14 @@ async function handleTurnstileVerify(request, env) {
         }
       }
 
-      // 通知用户
-      await tgApiCall(env, "sendMessage", {
-        chat_id: userId,
-        text: "✅ 验证成功！",
-        parse_mode: "Markdown"
-      });
+     // 通知用户
+await tgApiCall(env, "sendMessage", {
+  chat_id: userId,
+  text: "✅ 验证成功！您现在可以发送消息了",
+  parse_mode: "Markdown",
+  // 优化：添加通知参数，确保消息优先显示
+  disable_notification: false
+});
 
       return new Response(JSON.stringify({
         success: true,
@@ -891,7 +900,7 @@ function generateExpiredPage(title, description) {
   `;
 }
 
-// ---------------- 生成简化版验证页面（移除多余提示，修复按钮问题） ----------------
+// ---------------- 生成简化版验证页面 ----------------
 function generateVerifyPage(siteKey, verifyId, userId) {
   return `
 <!DOCTYPE html>
@@ -1021,7 +1030,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       border: 1px solid var(--border-color);
     }
 
-    /* 修复按钮显示问题 - 核心优化 */
+    /* 优化按钮样式 - 移除冗余图标 */
     #verify-btn {
       width: 100%;
       padding: 16px 24px;
@@ -1035,7 +1044,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 10px;
+      gap: 8px;
       box-shadow: 0 4px 15px rgba(0, 136, 204, 0.15);
       position: relative;
       overflow: hidden;
@@ -1073,10 +1082,6 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       cursor: not-allowed;
       transform: none;
       box-shadow: none;
-    }
-
-    #verify-btn i {
-      font-size: 20px;
     }
 
     .message-box {
@@ -1187,7 +1192,6 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       </div>
 
       <button id="verify-btn" disabled>
-        <i>✅</i>
         <span>完成验证</span>
       </button>
     </div>
@@ -1201,7 +1205,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
     // 初始化 Turnstile
     window.onload = function() {
       initTurnstile();
-      // 绑定按钮点击事件（修复按钮点击问题）
+      // 绑定按钮点击事件
       document.getElementById('verify-btn').addEventListener('click', submitVerify);
     };
 
@@ -1218,7 +1222,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
             token = t;
             const btn = document.getElementById('verify-btn');
             btn.disabled = false;
-            btn.innerHTML = '<i>✅</i><span>完成验证</span>';
+            btn.innerHTML = '<span>完成验证</span>';
             document.getElementById('error').style.display = 'none';
           },
           'error-callback': function(error) {
@@ -1235,7 +1239,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       initTurnstile();
     });
 
-    // 验证提交函数
+    // 验证提交函数 - 修复返回TG问题
     async function submitVerify() {
       if (!token) return;
       
@@ -1248,7 +1252,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
       successEl.style.display = 'none';
       btn.disabled = true;
       loadingEl.style.display = 'flex';
-      btn.innerHTML = '<i>⏳</i><span>验证中...</span>';
+      btn.innerHTML = '<span>验证中...</span>';
       
       try {
         const res = await fetch(window.location.href, {
@@ -1261,17 +1265,25 @@ function generateVerifyPage(siteKey, verifyId, userId) {
         
         if (data.success) {
           successEl.style.display = 'block';
-          successEl.textContent = '✅ 验证成功！窗口将自动关闭';
+          successEl.textContent = '✅ 验证成功！即将返回Telegram';
           btn.style.display = 'none';
           loadingEl.style.display = 'none';
           
-          setTimeout(() => window.close(), 2000);
+          // 优化：先通知成功，再延迟关闭（确保TG收到验证成功消息）
+          setTimeout(() => {
+            // 尝试返回Telegram客户端
+            if (window.TelegramWebviewProxy) {
+              window.TelegramWebviewProxy.close();
+            } else {
+              window.close();
+            }
+          }, 1500);
         } else {
           errorEl.style.display = 'block';
           errorEl.textContent = '❌ 验证失败：' + (data.error || '请重试');
           btn.disabled = false;
           loadingEl.style.display = 'none';
-          btn.innerHTML = '<i>🔄</i><span>重新验证</span>';
+          btn.innerHTML = '<span>重新验证</span>';
           
           initTurnstile();
           token = "";
@@ -1281,7 +1293,7 @@ function generateVerifyPage(siteKey, verifyId, userId) {
         errorEl.textContent = '❌ 网络错误：' + e.message;
         btn.disabled = false;
         loadingEl.style.display = 'none';
-        btn.innerHTML = '<i>🔗</i><span>重新验证</span>';
+        btn.innerHTML = '<span>重新验证</span>';
         
         initTurnstile();
         token = "";
@@ -1299,7 +1311,6 @@ function generateVerifyPage(siteKey, verifyId, userId) {
 </html>
   `;
 }
-
 async function tgApiCall(env, method, body) {
   try {
     const controller = new AbortController();

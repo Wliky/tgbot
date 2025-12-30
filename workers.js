@@ -1,13 +1,11 @@
 /**
  * Telegram 双向机器人 (Cloudflare Worker 实现)
- * 核心功能概述：
- * 1. 双向消息转发：用户私聊消息 ↔ 超级群组话题，支持文本/图片/视频/文档等媒体类型
- * 2. 智能自动点赞：统一使用🕊表情点赞，编辑消息时先显示🦄，1秒后自动切换为🕊
- * 3. 安全验证机制：基于Cloudflare Turnstile的人机验证，隐藏原始链接，简化验证流程
- * 4. 话题管理：自动为每个用户创建专属话题，名称格式为@用户名(用户ID)，仅首次显示用户信息
- * 5. 管理员功能：支持用户信息查看、验证重置、对话开关、封禁/解封、验证有效期设置等指令
- * 6. 极简体验：移除转发按钮，隐藏冗余提示，重置验证不通知用户，保持Telegram原生交互体验
- * 7. 健壮性保障：完善的错误处理、重试机制、超时控制，支持健康检查接口
+ * 核心功能：
+ * 1. 双向消息转发：用户私聊 ↔ 超级群组话题（文本/媒体）
+ * 2. 编辑消息表情：🦄（1秒）→ 🕊，普通消息直接显示🕊
+ * 3. 话题自动重建：检测到话题被删除时自动清理旧记录并重建（核心修复）
+ * 4. Turnstile验证：人机验证后才能发送消息
+ * 5. 管理员指令：用户信息/验证重置/封禁/有效期设置等
  */
 
 export default {
@@ -16,14 +14,14 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
 
-      // 1. 处理 Turnstile 验证
+      // 1. Turnstile验证处理
       if (path === "/turnstile-verify") {
         return await handleTurnstileVerify(request, env);
       }
 
-      // 2. 处理 Telegram Webhook
+      // 2. Telegram Webhook处理
       if (path === "/" && request.method === "POST") {
-        return await handleTelegramWebhook(request, env);
+        return await handleTelegramWebhook(request, env, ctx);
       }
 
       // 3. 健康检查
@@ -52,8 +50,8 @@ export default {
   }
 };
 
-// ---------------- 核心：处理 Telegram Webhook ----------------
-async function handleTelegramWebhook(request, env) {
+// ---------------- 核心：Telegram Webhook处理 ----------------
+async function handleTelegramWebhook(request, env, ctx) {
   try {
     const requestBody = await request.text();
     let update = {};
@@ -91,13 +89,14 @@ async function handleTelegramWebhook(request, env) {
       }
     }
 
-    // 兼容消息/编辑消息
+    // 精准识别编辑消息状态
+    const isEdit = !!update.edited_message;
     const msg = update.message || update.edited_message;
     if (!msg || msg.service) return new Response("OK");
 
     // 处理超级群组消息（管理员回复/指令）
     if (msg.chat?.type === "supergroup" && msg.message_thread_id) {
-      await handleAdminMessage(msg, env);
+      await handleAdminMessage(msg, env, isEdit, ctx);
       return new Response("OK");
     }
 
@@ -123,12 +122,36 @@ async function handleTelegramWebhook(request, env) {
       return new Response("OK");
     }
 
+    // 处理 /start 命令
+    if ((msg.text || "").trim() === "/start") {
+      await handleStartCommand(userId, env);
+      // 发送完欢迎信息后，检查验证状态，若未验证则发送验证链接
+      const isVerified = await env.TOPIC_MAP.get(`verified:${userId}`) === "1";
+      if (!isVerified) {
+        const verifyKeys = await env.TOPIC_MAP.list({ prefix: `verify:`, limit: 100 });
+        let hasActiveVerify = false;
+        
+        for (const key of verifyKeys.keys) {
+          const verifyData = await env.TOPIC_MAP.get(key.name, { type: "json" }).catch(() => null);
+          if (verifyData?.uid === userId.toString()) {
+            hasActiveVerify = true;
+            break;
+          }
+        }
+
+        if (!hasActiveVerify) {
+          await sendVerifyMessage(userId, env, msg.message_id);
+        }
+      }
+      return new Response("OK");
+    }
+
     // 检查验证状态
     const isVerified = await env.TOPIC_MAP.get(`verified:${userId}`) === "1";
     
     if (isVerified) {
-      // 已验证：转发用户消息到群组并点赞
-      await forwardUserMessageToGroup(msg, env, userName, userUsername, !!update.edited_message);
+      // 已验证：转发用户消息到群组并处理表情
+      await forwardUserMessageToGroup(msg, env, userName, userUsername, isEdit, ctx);
       return new Response("OK");
     }
 
@@ -156,8 +179,40 @@ async function handleTelegramWebhook(request, env) {
   }
 }
 
+// ---------------- 处理 /start 命令 ----------------
+async function handleStartCommand(userId, env) {
+  const startMessage = `欢迎使用双向私信机器人！
+
+📝 功能说明：
+• 发送的消息会自动转发到管理员群组
+• 编辑文本消息时会显示🦄表情，1秒后恢复为🕊
+• 🕊表情表示消息已成功转发
+
+⚠️ 注意：
+• 仅文本消息支持编辑
+• 需完成安全验证后才能发送消息`;
+
+  // 发送欢迎信息
+  const sendResult = await tgApiCall(env, "sendMessage", {
+    chat_id: userId,
+    text: startMessage,
+    parse_mode: "Markdown"
+  });
+
+  // 给欢迎消息添加🕊表情点赞
+  if (sendResult.ok) {
+    await setUnifiedReaction(
+      env,
+      userId,
+      sendResult.result.message_id,
+      null,
+      false
+    );
+  }
+}
+
 // ---------------- 处理管理员消息（回复/指令） ----------------
-async function handleAdminMessage(msg, env) {
+async function handleAdminMessage(msg, env, isEdit = false, ctx) {
   const threadId = msg.message_thread_id;
   const userId = await getUserIdByTopicId(threadId, env);
   const text = (msg.text || "").trim();
@@ -179,15 +234,10 @@ async function handleAdminMessage(msg, env) {
     return;
   }
 
-  // 判断是否为编辑消息
-  const isEdit = !!msg.edit_date;
-  
-  // 转发管理员回复给用户，并点赞管理员消息和用户收到的消息
+  // 转发管理员回复给用户，并处理表情
   if (msg.media_group_id) {
-    // 处理媒体组回复
-    await handleAdminMediaReply(msg, userId, env, threadId, isEdit);
+    await handleAdminMediaReply(msg, userId, env, threadId, isEdit, ctx);
   } else {
-    // 处理普通消息回复
     const copyResult = await tgApiCall(env, "copyMessage", {
       chat_id: userId,
       from_chat_id: env.SUPERGROUP_ID,
@@ -195,22 +245,24 @@ async function handleAdminMessage(msg, env) {
     });
 
     if (copyResult.ok) {
-      // 1. 给管理员发送的消息点赞
+      // 1. 给管理员消息添加表情
       await setUnifiedReaction(
         env, 
         env.SUPERGROUP_ID, 
         msg.message_id, 
         threadId, 
-        isEdit
+        isEdit,
+        ctx
       );
       
-      // 2. 给用户收到的回复消息点赞
+      // 2. 给用户收到的消息添加表情
       await setUnifiedReaction(
         env,
         userId,
         copyResult.result.message_id,
-        null, // 用户私聊没有话题ID
-        isEdit
+        null,
+        isEdit,
+        ctx
       );
     } else {
       console.error(`[转发管理员回复失败] 用户ID:${userId} 错误:${copyResult.description}`);
@@ -248,7 +300,7 @@ async function handleAdminCommand(text, userId, threadId, env) {
       break;
 
     case "/reset_verify":
-      // 重置验证状态 - 不通知用户，仅管理员收到提示
+      // 重置验证状态
       await env.TOPIC_MAP.delete(`verified:${userId}`);
       // 清理验证链接
       const verifyKeys = await env.TOPIC_MAP.list({ prefix: `verify:`, limit: 100 });
@@ -256,7 +308,7 @@ async function handleAdminCommand(text, userId, threadId, env) {
         const verifyData = await env.TOPIC_MAP.get(key.name, { type: "json" }).catch(() => null);
         if (verifyData?.uid === userId.toString()) await env.TOPIC_MAP.delete(key.name);
       }
-      // 仅通知管理员（不通知用户）
+      // 通知管理员
       await tgApiCall(env, "sendMessage", {
         chat_id: env.SUPERGROUP_ID,
         message_thread_id: threadId,
@@ -268,25 +320,49 @@ async function handleAdminCommand(text, userId, threadId, env) {
     case "/close":
       // 关闭对话
       await env.TOPIC_MAP.put(`user_closed:${userId}`, "1");
+      await tgApiCall(env, "sendMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        message_thread_id: threadId,
+        text: `✅ 用户 ${userId} 的对话已关闭`,
+        parse_mode: "Markdown"
+      });
       break;
 
     case "/open":
       // 打开对话
       await env.TOPIC_MAP.delete(`user_closed:${userId}`);
+      await tgApiCall(env, "sendMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        message_thread_id: threadId,
+        text: `✅ 用户 ${userId} 的对话已开启`,
+        parse_mode: "Markdown"
+      });
       break;
 
     case "/ban":
       // 封禁用户
       await env.TOPIC_MAP.put(`banned:${userId}`, "1");
+      await tgApiCall(env, "sendMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        message_thread_id: threadId,
+        text: `✅ 用户 ${userId} 已被封禁`,
+        parse_mode: "Markdown"
+      });
       break;
 
     case "/unban":
       // 解封用户
       await env.TOPIC_MAP.delete(`banned:${userId}`);
+      await tgApiCall(env, "sendMessage", {
+        chat_id: env.SUPERGROUP_ID,
+        message_thread_id: threadId,
+        text: `✅ 用户 ${userId} 已被解封`,
+        parse_mode: "Markdown"
+      });
       break;
 
     default:
-      // 处理有效期设置
+      // 处理验证有效期设置
       if (text.startsWith("/verify_ttl")) {
         const parts = text.split(" ");
         if (parts.length < 2) {
@@ -306,7 +382,7 @@ async function handleAdminCommand(text, userId, threadId, env) {
           await tgApiCall(env, "sendMessage", {
             chat_id: env.SUPERGROUP_ID,
             message_thread_id: threadId,
-            text: "❌ 支持：7d/30d/1y/永久",
+            text: "❌ 支持的有效期：7d/30d/1y/永久",
             parse_mode: "Markdown"
           });
           return;
@@ -318,7 +394,6 @@ async function handleAdminCommand(text, userId, threadId, env) {
           await env.TOPIC_MAP.put(`verified:${userId}`, "1");
         }
 
-        // 仅通知管理员
         await tgApiCall(env, "sendMessage", {
           chat_id: env.SUPERGROUP_ID,
           message_thread_id: threadId,
@@ -330,128 +405,157 @@ async function handleAdminCommand(text, userId, threadId, env) {
   }
 }
 
-// ---------------- 转发用户消息到群组（核心：点赞用户消息） ----------------
-async function forwardUserMessageToGroup(msg, env, userName, userUsername, isEdit = false) {
+// ---------------- 转发用户消息到群组（核心：话题重建+表情处理） ----------------
+async function forwardUserMessageToGroup(msg, env, userName, userUsername, isEdit = false, ctx) {
   try {
+    // 编辑消息仅支持文本类型
+    if (isEdit && !msg.text) {
+      console.warn("[编辑消息限制] 仅支持文本消息，忽略媒体消息编辑");
+      return;
+    }
+
     const userId = msg.from.id;
-    // 获取/创建话题ID（仅首次显示用户信息）
-    const topicId = await getOrCreateTopicId(userId, env, userName, userUsername);
-
-    if (msg.media_group_id) {
-      // 处理媒体组消息
-      await handleUserMediaGroup(msg, env, topicId, isEdit);
-    } else {
-      // 转发普通消息
-      const forwardResult = await tgApiCall(env, "forwardMessage", {
-        chat_id: env.SUPERGROUP_ID,
-        from_chat_id: msg.chat.id,
-        message_id: msg.message_id,
-        message_thread_id: topicId
+    // 获取/重建用户话题ID（核心修复：话题删除后自动重建）
+    const topicId = await getOrRecreateTopicId(userId, env, userName, userUsername);
+    
+    if (!topicId) {
+      await tgApiCall(env, "sendMessage", {
+        chat_id: userId,
+        text: "⚠️ 话题创建失败，请稍后重试",
+        parse_mode: "Markdown"
       });
+      return;
+    }
 
-      if (forwardResult.ok) {
-        // 1. 给群组中的消息点赞
-        await setUnifiedReaction(
-          env,
-          env.SUPERGROUP_ID,
-          forwardResult.result.message_id,
-          topicId,
-          isEdit
-        );
-        
-        // 2. 给用户的原始消息点赞
-        await setUnifiedReaction(
-          env,
-          msg.chat.id,
-          msg.message_id,
-          null, // 用户私聊没有话题ID
-          isEdit
-        );
+    if (msg.media_group_id && !isEdit) {
+      // 处理媒体组消息（非编辑）
+      await handleUserMediaGroup(msg, env, topicId, isEdit, ctx);
+    } else {
+      let forwardResult, targetMsgId = null;
+      
+      // 编辑消息强制使用copyMessage（forward不支持编辑后的消息）
+      if (isEdit) {
+        forwardResult = await tgApiCall(env, "copyMessage", {
+          chat_id: env.SUPERGROUP_ID,
+          from_chat_id: msg.chat.id,
+          message_id: msg.message_id,
+          message_thread_id: topicId,
+          text: msg.text // 强制传递最新编辑的文本
+        });
       } else {
-        // 降级复制消息
-        const copyResult = await tgApiCall(env, "copyMessage", {
+        // 普通消息优先forward
+        forwardResult = await tgApiCall(env, "forwardMessage", {
           chat_id: env.SUPERGROUP_ID,
           from_chat_id: msg.chat.id,
           message_id: msg.message_id,
           message_thread_id: topicId
         });
 
-        if (copyResult.ok) {
-          // 1. 给群组中的消息点赞
-          await setUnifiedReaction(
-            env,
-            env.SUPERGROUP_ID,
-            copyResult.result.message_id,
-            topicId,
-            isEdit
-          );
-          
-          // 2. 给用户的原始消息点赞
-          await setUnifiedReaction(
-            env,
-            msg.chat.id,
-            msg.message_id,
-            null, // 用户私聊没有话题ID
-            isEdit
-          );
+        // forward失败则降级为copy
+        if (!forwardResult.ok) {
+          forwardResult = await tgApiCall(env, "copyMessage", {
+            chat_id: env.SUPERGROUP_ID,
+            from_chat_id: msg.chat.id,
+            message_id: msg.message_id,
+            message_thread_id: topicId
+          });
         }
+      }
+
+      if (forwardResult.ok) {
+        targetMsgId = forwardResult.result.message_id;
+      }
+
+      if (targetMsgId) {
+        // 1. 给群组中的消息添加表情
+        await setUnifiedReaction(
+          env,
+          env.SUPERGROUP_ID,
+          targetMsgId,
+          topicId,
+          isEdit,
+          ctx
+        );
+        
+        // 2. 给用户的原始消息添加表情
+        await setUnifiedReaction(
+          env,
+          msg.chat.id,
+          msg.message_id,
+          null,
+          isEdit,
+          ctx
+        );
+      } else {
+        console.error(`[转发失败] 用户ID:${userId} 消息ID:${msg.message_id} 错误:${forwardResult?.description}`);
       }
     }
   } catch (error) {
     console.error("[转发用户消息失败]", error.message);
     await tgApiCall(env, "sendMessage", {
       chat_id: msg.chat.id,
-      text: "🚫 消息发送失败",
+      text: "🚫 消息发送失败，请稍后重试",
       parse_mode: "Markdown"
     }).catch(() => {});
   }
 }
 
-// ---------------- 核心：统一的表情设置函数 ----------------
-async function setUnifiedReaction(env, chatId, messageId, threadId = null, isEdit = false, maxRetries = 3) {
-  try {
-    const reactionParams = {
+// ---------------- 核心：统一表情设置（修复编辑消息🦄→🕊切换） ----------------
+async function setUnifiedReaction(env, chatId, messageId, threadId = null, isEdit = false, ctx, maxRetries = 3) {
+  // 封装表情设置函数，增加重试机制
+  const setReaction = async (emoji) => {
+    const params = {
       chat_id: chatId,
       message_id: messageId,
-      reaction: [{ type: "emoji", emoji: isEdit ? "🦄" : "🕊" }]
+      reaction: [{ type: "emoji", emoji: emoji }],
+      is_big: false // 避免大表情影响体验
     };
     
-    // 如果有话题ID，添加参数
     if (threadId !== null) {
-      reactionParams.message_thread_id = threadId;
+      params.message_thread_id = threadId;
     }
-    
-    // 设置初始表情
+
     for (let i = 0; i < maxRetries; i++) {
       try {
-        await tgApiCall(env, "setMessageReaction", reactionParams);
-        break;
+        const result = await tgApiCall(env, "setMessageReaction", params);
+        if (result.ok) {
+          return true;
+        }
+        // 400错误（话题不存在）直接终止重试
+        if (result.error_code === 400 && result.description.includes("message_thread_id")) {
+          console.error(`[表情设置失败] 话题不存在 chatId:${chatId} threadId:${threadId}`);
+          return false;
+        }
+        // 其他错误重试
+        await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
       } catch (error) {
         if (i === maxRetries - 1) {
-          console.error(`[设置反应失败] 重试 ${i + 1}次失败:`, error.message);
-        } else {
-          await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
+          console.error(`[设置表情失败] 表情:${emoji} 重试${maxRetries}次失败:`, error.message);
+          return false;
         }
+        await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
       }
     }
+    return false;
+  };
+
+  try {
+    // 第一步：清空原有表情（避免叠加）
+    await setReaction("");
     
-    // 如果是编辑消息，1秒后改为🕊
-    if (isEdit) {
-      setTimeout(async () => {
-        reactionParams.reaction = [{ type: "emoji", emoji: "🕊" }];
-        for (let i = 0; i < maxRetries; i++) {
-          try {
-            await tgApiCall(env, "setMessageReaction", reactionParams);
-            break;
-          } catch (error) {
-            if (i === maxRetries - 1) {
-              console.error(`[编辑后改回鸽子失败] 重试 ${i + 1}次失败:`, error.message);
-            } else {
-              await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
-            }
-          }
-        }
-      }, 1000);
+    // 第二步：设置初始表情
+    const initialEmoji = isEdit ? "🦄" : "🕊";
+    const setInitial = await setReaction(initialEmoji);
+    
+    // 第三步：编辑消息1秒后切换为🕊
+    if (isEdit && setInitial) {
+      // 使用ctx.waitUntil确保Worker不提前终止
+      ctx.waitUntil(new Promise(resolve => {
+        setTimeout(async () => {
+          await setReaction("🕊");
+          resolve();
+        }, 1000); // 严格1秒延迟
+      }));
     }
   } catch (error) {
     console.error("[统一点赞失败]", error.message);
@@ -459,7 +563,7 @@ async function setUnifiedReaction(env, chatId, messageId, threadId = null, isEdi
 }
 
 // ---------------- 处理管理员媒体组回复 ----------------
-async function handleAdminMediaReply(msg, userId, env, threadId, isEdit = false) {
+async function handleAdminMediaReply(msg, userId, env, threadId, isEdit = false, ctx) {
   const groupId = msg.media_group_id;
   const cacheKey = `admin_media:${groupId}`;
   
@@ -489,15 +593,16 @@ async function handleAdminMediaReply(msg, userId, env, threadId, isEdit = false)
         });
 
         if (sendResult.ok) {
-          // 1. 点赞管理员的媒体组消息
-          await setUnifiedReaction(env, env.SUPERGROUP_ID, msg.message_id, threadId, isEdit);
+          // 1. 给管理员的媒体消息添加表情
+          await setUnifiedReaction(env, env.SUPERGROUP_ID, msg.message_id, threadId, isEdit, ctx);
           
-          // 2. 点赞用户收到的媒体组消息
+          // 2. 给用户收到的每条媒体消息添加表情
           for (const msgItem of sendResult.result) {
-            await setUnifiedReaction(env, userId, msgItem.message_id, null, isEdit);
+            await setUnifiedReaction(env, userId, msgItem.message_id, null, isEdit, ctx);
           }
         }
 
+        // 清理缓存
         await env.TOPIC_MAP.delete(cacheKey);
       }
     }, 2000);
@@ -505,7 +610,10 @@ async function handleAdminMediaReply(msg, userId, env, threadId, isEdit = false)
 }
 
 // ---------------- 处理用户媒体组消息 ----------------
-async function handleUserMediaGroup(msg, env, topicId, isEdit = false) {
+async function handleUserMediaGroup(msg, env, topicId, isEdit = false, ctx) {
+  // 编辑消息不支持媒体组
+  if (isEdit) return;
+
   const groupId = msg.media_group_id;
   const cacheKey = `user_media:${groupId}`;
   
@@ -521,7 +629,7 @@ async function handleUserMediaGroup(msg, env, topicId, isEdit = false) {
     mediaGroup.items.push(mediaItem);
     await env.TOPIC_MAP.put(cacheKey, JSON.stringify(mediaGroup), { expirationTtl: 60 });
 
-    // 延迟发送
+    // 延迟发送（等待所有媒体分片）
     setTimeout(async () => {
       const latestMedia = await env.TOPIC_MAP.get(cacheKey, { type: "json" }).catch(() => null);
       if (latestMedia?.items.length) {
@@ -536,53 +644,75 @@ async function handleUserMediaGroup(msg, env, topicId, isEdit = false) {
         });
 
         if (sendResult.ok) {
-          // 1. 点赞用户原始消息（每条媒体组消息对应一个点赞）
-          await setUnifiedReaction(env, msg.chat.id, msg.message_id, null, isEdit);
+          // 1. 给用户原始消息添加表情
+          await setUnifiedReaction(env, msg.chat.id, msg.message_id, null, isEdit, ctx);
           
-          // 2. 点赞每条媒体消息（使用🕊）
+          // 2. 给群组中的每条媒体消息添加表情
           for (const msgItem of sendResult.result) {
-            await setUnifiedReaction(env, env.SUPERGROUP_ID, msgItem.message_id, topicId, isEdit);
+            await setUnifiedReaction(env, env.SUPERGROUP_ID, msgItem.message_id, topicId, isEdit, ctx);
           }
         }
 
+        // 清理缓存
         await env.TOPIC_MAP.delete(cacheKey);
       }
     }, 2000);
   }
 }
 
-// ---------------- 获取/创建话题ID（仅首次显示用户信息） ----------------
-async function getOrCreateTopicId(userId, env, userName, userUsername) {
+// ---------------- 获取/重建用户话题（核心修复：删除后自动重建） ----------------
+async function getOrRecreateTopicId(userId, env, userName, userUsername) {
   const topicKey = `user_topic:${userId}`;
   let topicId = await env.TOPIC_MAP.get(topicKey).catch(() => null);
 
-  if (topicId) return Number(topicId);
+  // 1. 有缓存的话题ID，先验证是否存在
+  if (topicId) {
+    topicId = Number(topicId);
+    // 验证话题是否存在（改用更可靠的getChatForumTopic接口）
+    const checkResult = await tgApiCall(env, "getChatForumTopic", {
+      chat_id: env.SUPERGROUP_ID,
+      message_thread_id: topicId
+    }).catch(() => ({ ok: false }));
+    
+    // 话题存在，直接返回
+    if (checkResult.ok) {
+      return topicId;
+    }
+    
+    // 话题不存在，清理旧缓存（含反向映射）
+    console.warn(`[话题不存在] 用户ID:${userId} 旧话题ID:${topicId}，开始重建`);
+    await env.TOPIC_MAP.delete(topicKey);
+    await env.TOPIC_MAP.delete(`topic_user:${topicId}`); // 清理旧反向映射
+  }
 
-  // 首次创建话题 - 优化：固定话题名称格式为 @用户名(用户ID)
+  // 2. 创建新话题
   userName = userName || (await getUserName(userId, env));
-  // 格式化话题名称：优先用@用户名，无则用昵称
   const topicName = userUsername ? `${userUsername}(${userId})` : `${userName}(${userId})`;
   
   const createResult = await tgApiCall(env, "createForumTopic", {
     chat_id: env.SUPERGROUP_ID,
-    name: topicName // 使用格式化后的名称
+    name: topicName,
+    icon_color: 0x6FB9F0 // 蓝色主题色
   });
 
   if (createResult.ok) {
-    topicId = createResult.result.message_thread_id;
-    await env.TOPIC_MAP.put(topicKey, topicId.toString());
+    const newTopicId = createResult.result.message_thread_id;
+    await env.TOPIC_MAP.put(topicKey, newTopicId.toString());
+    // 新增：建立话题ID→用户ID的反向映射（关键修复）
+    await env.TOPIC_MAP.put(`topic_user:${newTopicId}`, userId.toString());
 
-    // 仅首次显示用户信息
+    // 首次创建话题，发送用户信息
     await tgApiCall(env, "sendMessage", {
       chat_id: env.SUPERGROUP_ID,
-      message_thread_id: topicId,
-      text: `📋 用户信息\n├─ 用户名：${userName}\n├─ 账号：${userUsername || "无"}\n└─ 用户ID：${userId}`,
+      message_thread_id: newTopicId,
+      text: `📋 新用户会话\n├─ 昵称：${userName}\n├─ 用户名：${userUsername || "无"}\n└─ 用户ID：${userId}`,
       parse_mode: "Markdown"
     });
 
-    return topicId;
+    return newTopicId;
   }
 
+  console.error(`[创建话题失败] 用户ID:${userId} 错误:${createResult.description}`);
   return 0;
 }
 
@@ -600,32 +730,42 @@ async function sendVerifyMessage(userId, env, msgId = null) {
   await env.TOPIC_MAP.put(
     `verify:${verifyId}`,
     JSON.stringify({ uid: userId.toString(), msgId }),
-    { expirationTtl: 300 }
+    { expirationTtl: 300 } // 5分钟过期
   );
 
   const verifyUrl = `https://${env.WORKER_DOMAIN}/turnstile-verify?vid=${verifyId}&uid=${userId}`;
   
-  // 优化：简化安全验证提示语言，隐藏原始链接
+  // 发送验证消息
   await tgApiCall(env, "sendMessage", {
     chat_id: userId,
-    text: `🛡️ 安全验证\n\n请完成人机验证后发送消息：`,
+    text: `🛡️ 安全验证\n\n请完成人机验证后才能发送消息：`,
     parse_mode: "Markdown",
     disable_web_page_preview: true,
+    reply_to_message_id: msgId,
     reply_markup: {
       inline_keyboard: [
-        [{ text: "✅ 点击验证", url: verifyUrl }],
+        [{ text: "✅ 点击完成验证", url: verifyUrl }],
         [{ text: "🔄 重新获取链接", callback_data: `refresh_verify:${verifyId}` }]
       ]
     }
   });
 }
 
+// ---------------- 修复：通过话题ID获取用户ID（优先反向映射） ----------------
 async function getUserIdByTopicId(threadId, env) {
+  // 优先读取反向映射（性能+准确性提升）
+  const directUserId = await env.TOPIC_MAP.get(`topic_user:${threadId}`).catch(() => null);
+  if (directUserId) return Number(directUserId);
+  
+  // 兼容旧数据：遍历查找
   const list = await env.TOPIC_MAP.list({ prefix: "user_topic:" });
   for (const key of list.keys) {
     const storedTopicId = await env.TOPIC_MAP.get(key.name).catch(() => null);
     if (storedTopicId?.toString() === threadId.toString()) {
-      return Number(key.name.replace("user_topic:", ""));
+      const userId = Number(key.name.replace("user_topic:", ""));
+      // 同步建立反向映射（修复旧数据）
+      await env.TOPIC_MAP.put(`topic_user:${threadId}`, userId.toString());
+      return userId;
     }
   }
   return null;
@@ -642,8 +782,7 @@ async function handleTurnstileVerify(request, env) {
   const userId = url.searchParams.get("uid");
 
   if (!verifyId || !userId || isNaN(Number(userId))) {
-    // 优化：返回美观的无效链接页面
-    return new Response(generateExpiredPage("无效的验证链接", "链接参数错误"), {
+    return new Response(generateExpiredPage("无效的验证链接", "链接参数错误或已失效"), {
       status: 400,
       headers: {
         "Content-Type": "text/html; charset=utf-8",
@@ -656,8 +795,7 @@ async function handleTurnstileVerify(request, env) {
   if (request.method === "GET") {
     const verifyState = await env.TOPIC_MAP.get(`verify:${verifyId}`);
     if (!verifyState) {
-      // 优化：返回美观的过期页面
-      return new Response(generateExpiredPage("验证链接已过期", "请重新发送消息获取新链接"), {
+      return new Response(generateExpiredPage("验证链接已过期", "请重新发送消息获取新的验证链接"), {
         status: 400,
         headers: {
           "Content-Type": "text/html; charset=utf-8",
@@ -695,12 +833,12 @@ async function handleTurnstileVerify(request, env) {
       if (!turnstileData.success) {
         return new Response(JSON.stringify({
           success: false,
-          error: turnstileData["error-codes"]?.join(", ") || "验证失败"
+          error: turnstileData["error-codes"]?.join(", ") || "验证失败，请重试"
         }), { headers: { "Content-Type": "application/json" } });
       }
 
-      // 验证成功
-      await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: 604800 });
+      // 验证成功，标记用户为已验证
+      await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: 604800 }); // 7天有效期
       
       // 清理验证链接
       const verifyKeys = await env.TOPIC_MAP.list({ prefix: `verify:`, limit: 100 });
@@ -709,7 +847,7 @@ async function handleTurnstileVerify(request, env) {
         if (verifyData?.uid === userId.toString()) await env.TOPIC_MAP.delete(key.name);
       }
 
-      // 转发待发送消息
+      // 转发验证前的待发送消息
       const verifyState = await env.TOPIC_MAP.get(`verify:${verifyId}`, { type: "json" }).catch(() => null);
       if (verifyState?.msgId) {
         const msgRes = await tgApiCall(env, "getMessage", {
@@ -724,24 +862,24 @@ async function handleTurnstileVerify(request, env) {
         }
       }
 
-     // 通知用户
-await tgApiCall(env, "sendMessage", {
-  chat_id: userId,
-  text: "✅ 验证成功！您现在可以发送消息了",
-  parse_mode: "Markdown",
-  // 优化：添加通知参数，确保消息优先显示
-  disable_notification: false
-});
+      // 通知用户验证成功
+      await tgApiCall(env, "sendMessage", {
+        chat_id: userId,
+        text: "✅ 验证成功！您现在可以正常发送消息了",
+        parse_mode: "Markdown",
+        disable_notification: false
+      });
 
       return new Response(JSON.stringify({
         success: true,
-        message: "验证成功"
+        message: "验证成功，即将返回Telegram"
       }), { headers: { "Content-Type": "application/json" } });
 
     } catch (error) {
+      console.error("[验证处理失败]", error.message);
       return new Response(JSON.stringify({
         success: false,
-        error: error.message
+        error: "服务器内部错误，请重试"
       }), { headers: { "Content-Type": "application/json" } });
     }
   }
@@ -749,7 +887,7 @@ await tgApiCall(env, "sendMessage", {
   return new Response("不支持的请求方法", { status: 405 });
 }
 
-// ---------------- 生成美观的过期/无效链接页面 ----------------
+// ---------------- 生成过期/无效链接页面 ----------------
 function generateExpiredPage(title, description) {
   return `
 <!DOCTYPE html>
@@ -757,150 +895,62 @@ function generateExpiredPage(title, description) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} - 安全验证</title>
+  <title>${title}</title>
   <style>
-    :root {
-      --bg-color: #ffffff;
-      --text-color: #333333;
-      --card-bg: #f8f9fa;
-      --border-color: #e0e0e0;
-      --error-color: #dc3545;
-      --primary-color: #0088cc;
-      --shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
-    }
-
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg-color: #1a1a1a;
-        --text-color: #f0f0f0;
-        --card-bg: #2d2d2d;
-        --border-color: #404040;
-        --error-color: #ff3b30;
-        --primary-color: #3399ff;
-        --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-      }
-    }
-
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-      transition: background-color 0.3s ease, color 0.3s ease;
-    }
-
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background-color: var(--bg-color);
-      color: var(--text-color);
-      line-height: 1.6;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
       min-height: 100vh;
-      padding: 20px;
       display: flex;
       align-items: center;
       justify-content: center;
+      padding: 20px;
     }
-
-    .container {
-      max-width: 500px;
-      width: 100%;
-      margin: 0 auto;
-    }
-
     .card {
-      background-color: var(--card-bg);
-      border-radius: 20px;
-      padding: 40px 32px;
-      box-shadow: var(--shadow);
-      border: 1px solid var(--border-color);
+      background: white;
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 400px;
+      width: 100%;
       text-align: center;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
     }
-
-    .icon {
-      font-size: 64px;
-      color: var(--error-color);
-      margin-bottom: 24px;
+    .icon { font-size: 64px; margin-bottom: 20px; }
+    .title { font-size: 24px; font-weight: 600; margin-bottom: 12px; color: #333; }
+    .desc { color: #666; line-height: 1.6; margin-bottom: 30px; }
+    .btn {
       display: inline-block;
-    }
-
-    .title {
-      font-size: 28px;
-      font-weight: 600;
-      margin-bottom: 16px;
-      color: var(--text-color);
-    }
-
-    .description {
-      font-size: 16px;
-      color: var(--text-color);
-      opacity: 0.8;
-      margin-bottom: 32px;
-      line-height: 1.8;
-    }
-
-    .action-btn {
-      display: inline-block;
-      padding: 14px 32px;
-      background-color: var(--primary-color);
+      padding: 12px 30px;
+      background: #0088cc;
       color: white;
-      border: none;
-      border-radius: 12px;
-      font-size: 16px;
-      font-weight: 500;
+      border-radius: 8px;
       text-decoration: none;
-      cursor: pointer;
-      transition: all 0.2s ease;
+      font-weight: 500;
+      transition: background 0.2s;
     }
-
-    .action-btn:hover {
-      background-color: #006699;
-      transform: translateY(-2px);
-      box-shadow: 0 8px 15px rgba(0, 136, 204, 0.2);
-    }
-
-    .action-btn:active {
-      transform: translateY(0);
-    }
-
-    @media (max-width: 600px) {
-      body {
-        padding: 16px;
-      }
-      
-      .card {
-        padding: 32px 24px;
-      }
-      
-      .title {
-        font-size: 24px;
-      }
-      
-      .description {
-        font-size: 14px;
-      }
-      
-      .action-btn {
-        padding: 12px 24px;
-        font-size: 15px;
-        width: 100%;
-      }
+    .btn:hover { background: #006699; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1a1a1a; }
+      .card { background: #2d2d2d; }
+      .title { color: #fff; }
+      .desc { color: #ccc; }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="card">
-      <div class="icon">🔒</div>
-      <h1 class="title">${title}</h1>
-      <p class="description">${description}</p>
-      <a href="javascript:window.close()" class="action-btn">关闭窗口</a>
-    </div>
+  <div class="card">
+    <div class="icon">🔒</div>
+    <h1 class="title">${title}</h1>
+    <p class="desc">${description}</p>
+    <a href="javascript:window.close()" class="btn">关闭窗口</a>
   </div>
 </body>
 </html>
   `;
 }
 
-// ---------------- 生成简化版验证页面 ----------------
+// ---------------- 生成验证页面 ----------------
 function generateVerifyPage(siteKey, verifyId, userId) {
   return `
 <!DOCTYPE html>
@@ -911,367 +961,167 @@ function generateVerifyPage(siteKey, verifyId, userId) {
   <title>安全验证</title>
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"></script>
   <style>
-    :root {
-      --bg-color: #ffffff;
-      --text-color: #333333;
-      --card-bg: #f8f9fa;
-      --border-color: #e0e0e0;
-      --primary-color: #0088cc;
-      --primary-hover: #006699;
-      --success-color: #28a745;
-      --error-color: #dc3545;
-      --shadow: 0 8px 30px rgba(0, 0, 0, 0.1);
-      --gradient: linear-gradient(135deg, #0088cc 0%, #00a8e8 100%);
-    }
-
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg-color: #121212;
-        --text-color: #f5f5f5;
-        --card-bg: #1e1e1e;
-        --border-color: #333333;
-        --primary-color: #3399ff;
-        --primary-hover: #66b3ff;
-        --success-color: #34c759;
-        --error-color: #ff3b30;
-        --shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
-        --gradient: linear-gradient(135deg, #3399ff 0%, #0066cc 100%);
-      }
-    }
-
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-      transition: all 0.3s ease;
-    }
-
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background-color: var(--bg-color);
-      color: var(--text-color);
-      line-height: 1.6;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
       min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       padding: 20px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
     }
-
-    .container {
-      max-width: 520px;
-      width: 100%;
-      margin: 0 auto;
-    }
-
     .card {
-      background-color: var(--card-bg);
-      border-radius: 24px;
-      padding: 40px 32px;
-      box-shadow: var(--shadow);
-      border: 1px solid var(--border-color);
-      position: relative;
-      overflow: hidden;
+      background: white;
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 450px;
+      width: 100%;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.1);
     }
-
-    .card::before {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 4px;
-      background: var(--gradient);
-    }
-
-    .header {
-      text-align: center;
-      margin-bottom: 32px;
-    }
-
-    .icon-wrapper {
-      width: 80px;
-      height: 80px;
-      background: var(--gradient);
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin: 0 auto 20px;
-      box-shadow: 0 4px 15px rgba(0, 136, 204, 0.2);
-    }
-
-    .icon {
-      font-size: 40px;
-      color: white;
-    }
-
-    .title {
-      font-size: 28px;
-      font-weight: 700;
-      margin-bottom: 8px;
-      color: var(--text-color);
-    }
-
-    .subtitle {
-      font-size: 16px;
-      color: var(--text-color);
-      opacity: 0.8;
-    }
-
-    .turnstile-container {
-      display: flex;
-      justify-content: center;
-      margin: 30px 0;
-      min-height: 70px;
-      padding: 10px;
-      border-radius: 12px;
-      background-color: rgba(0, 0, 0, 0.02);
-      border: 1px solid var(--border-color);
-    }
-
-    /* 优化按钮样式 - 移除冗余图标 */
+    .header { text-align: center; margin-bottom: 30px; }
+    .icon { font-size: 48px; margin-bottom: 16px; }
+    .title { font-size: 22px; font-weight: 600; color: #333; }
+    .subtitle { color: #666; margin-top: 8px; }
+    .turnstile-container { margin: 20px 0; min-height: 70px; }
     #verify-btn {
       width: 100%;
-      padding: 16px 24px;
-      background: var(--gradient);
+      padding: 14px;
+      background: #0088cc;
       color: white;
       border: none;
-      border-radius: 12px;
+      border-radius: 8px;
       font-size: 16px;
-      font-weight: 600;
+      font-weight: 500;
       cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      box-shadow: 0 4px 15px rgba(0, 136, 204, 0.15);
-      position: relative;
-      overflow: hidden;
-      z-index: 1;
+      transition: background 0.2s;
+      margin-top: 10px;
     }
-
-    #verify-btn::after {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: -100%;
-      width: 100%;
-      height: 100%;
-      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-      transition: 0.5s;
-      z-index: -1;
-    }
-
-    #verify-btn:hover:not(:disabled)::after {
-      left: 100%;
-    }
-
-    #verify-btn:hover:not(:disabled) {
-      transform: translateY(-2px);
-      box-shadow: 0 8px 20px rgba(0, 136, 204, 0.25);
-    }
-
-    #verify-btn:active:not(:disabled) {
-      transform: translateY(0);
-      box-shadow: 0 4px 10px rgba(0, 136, 204, 0.2);
-    }
-
     #verify-btn:disabled {
-      opacity: 0.7;
+      background: #999;
       cursor: not-allowed;
-      transform: none;
-      box-shadow: none;
     }
-
-    .message-box {
-      padding: 16px;
-      border-radius: 12px;
-      margin: 20px 0;
+    #verify-btn:hover:not(:disabled) {
+      background: #006699;
+    }
+    .message {
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 20px;
       display: none;
-      border-left: 4px solid;
     }
-
-    .error-message {
-      background-color: rgba(220, 53, 69, 0.08);
-      color: var(--error-color);
-      border-color: var(--error-color);
-    }
-
-    .success-message {
-      background-color: rgba(40, 167, 69, 0.08);
-      color: var(--success-color);
-      border-color: var(--success-color);
-    }
-
+    .success { background: #e8f5e9; color: #2e7d32; }
+    .error { background: #ffebee; color: #c62828; }
     .loading {
       display: none;
-      justify-content: center;
-      margin: 15px 0;
+      text-align: center;
+      margin: 20px 0;
     }
-
-    .loading-spinner {
+    .spinner {
       width: 24px;
       height: 24px;
-      border: 3px solid rgba(0, 136, 204, 0.2);
-      border-top-color: var(--primary-color);
+      border: 3px solid #eee;
+      border-top: 3px solid #0088cc;
       border-radius: 50%;
       animation: spin 1s linear infinite;
+      margin: 0 auto;
     }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
-    @media (max-width: 600px) {
-      body {
-        padding: 16px;
-      }
-      
-      .card {
-        padding: 32px 24px;
-      }
-      
-      .title {
-        font-size: 24px;
-      }
-      
-      .subtitle {
-        font-size: 14px;
-      }
-      
-      .icon-wrapper {
-        width: 70px;
-        height: 70px;
-      }
-      
-      .icon {
-        font-size: 36px;
-      }
-      
-      #verify-btn {
-        padding: 14px 20px;
-        font-size: 15px;
-      }
-    }
-
-    @media (max-width: 400px) {
-      .card {
-        padding: 24px 16px;
-      }
-      
-      .icon-wrapper {
-        width: 60px;
-        height: 60px;
-      }
-      
-      .icon {
-        font-size: 32px;
-      }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1a1a1a; }
+      .card { background: #2d2d2d; }
+      .title { color: #fff; }
+      .subtitle, .desc { color: #ccc; }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="card">
-      <div class="header">
-        <div class="icon-wrapper">
-          <div class="icon">🛡️</div>
-        </div>
-        <h1 class="title">安全验证</h1>
-        <p class="subtitle">完成验证即可发送消息</p>
-      </div>
-
-      <div id="turnstile-widget" class="turnstile-container"></div>
-
-      <div id="error" class="message-box error-message"></div>
-      <div id="success" class="message-box success-message"></div>
-
-      <div class="loading" id="loading">
-        <div class="loading-spinner"></div>
-      </div>
-
-      <button id="verify-btn" disabled>
-        <span>完成验证</span>
-      </button>
+  <div class="card">
+    <div class="header">
+      <div class="icon">🛡️</div>
+      <h1 class="title">安全验证</h1>
+      <p class="subtitle">完成验证后即可发送消息</p>
     </div>
+    
+    <div id="turnstile-widget" class="turnstile-container"></div>
+    
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+    </div>
+    
+    <div id="success-msg" class="message success"></div>
+    <div id="error-msg" class="message error"></div>
+    
+    <button id="verify-btn" disabled>完成验证</button>
   </div>
 
   <script>
     let token = "";
     let widgetId = null;
-    const isDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    
-    // 初始化 Turnstile
-    window.onload = function() {
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    // 初始化Turnstile
+    window.onload = () => {
       initTurnstile();
-      // 绑定按钮点击事件
       document.getElementById('verify-btn').addEventListener('click', submitVerify);
     };
 
-    // 初始化Turnstile
     function initTurnstile() {
       if (window.turnstile) {
         if (widgetId) window.turnstile.remove(widgetId);
-        
         widgetId = window.turnstile.render('#turnstile-widget', {
           sitekey: "${siteKey}",
-          theme: isDarkMode ? 'dark' : 'light',
-          size: 'normal',
-          callback: function(t) {
+          theme: isDark ? 'dark' : 'light',
+          callback: (t) => {
             token = t;
-            const btn = document.getElementById('verify-btn');
-            btn.disabled = false;
-            btn.innerHTML = '<span>完成验证</span>';
-            document.getElementById('error').style.display = 'none';
+            document.getElementById('verify-btn').disabled = false;
+            document.getElementById('error-msg').style.display = 'none';
           },
-          'error-callback': function(error) {
-            const errorEl = document.getElementById('error');
-            errorEl.style.display = 'block';
-            errorEl.textContent = '验证加载失败，请刷新页面重试';
+          'error-callback': (err) => {
+            showMessage('error', '验证加载失败，请刷新页面重试');
           }
         });
       }
     }
 
-    // 监听主题变化
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+    // 监听主题切换
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       initTurnstile();
     });
 
-    // 验证提交函数 - 修复返回TG问题
+    // 提交验证
     async function submitVerify() {
       if (!token) return;
       
       const btn = document.getElementById('verify-btn');
-      const errorEl = document.getElementById('error');
-      const successEl = document.getElementById('success');
-      const loadingEl = document.getElementById('loading');
+      const loading = document.getElementById('loading');
+      const successMsg = document.getElementById('success-msg');
+      const errorMsg = document.getElementById('error-msg');
       
-      errorEl.style.display = 'none';
-      successEl.style.display = 'none';
+      // 重置状态
+      successMsg.style.display = 'none';
+      errorMsg.style.display = 'none';
       btn.disabled = true;
-      loadingEl.style.display = 'flex';
-      btn.innerHTML = '<span>验证中...</span>';
+      loading.style.display = 'block';
+      btn.textContent = '验证中...';
       
       try {
         const res = await fetch(window.location.href, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token })
         });
         
         const data = await res.json();
         
+        loading.style.display = 'none';
         if (data.success) {
-          successEl.style.display = 'block';
-          successEl.textContent = '✅ 验证成功！即将返回Telegram';
+          successMsg.textContent = '✅ 验证成功！即将返回Telegram';
+          successMsg.style.display = 'block';
           btn.style.display = 'none';
-          loadingEl.style.display = 'none';
           
-          // 优化：先通知成功，再延迟关闭（确保TG收到验证成功消息）
+          // 延迟关闭，确保消息发送成功
           setTimeout(() => {
-            // 尝试返回Telegram客户端
             if (window.TelegramWebviewProxy) {
               window.TelegramWebviewProxy.close();
             } else {
@@ -1279,29 +1129,39 @@ function generateVerifyPage(siteKey, verifyId, userId) {
             }
           }, 1500);
         } else {
-          errorEl.style.display = 'block';
-          errorEl.textContent = '❌ 验证失败：' + (data.error || '请重试');
+          showMessage('error', '❌ ' + (data.error || '验证失败，请重试'));
           btn.disabled = false;
-          loadingEl.style.display = 'none';
-          btn.innerHTML = '<span>重新验证</span>';
-          
+          btn.textContent = '重新验证';
           initTurnstile();
-          token = "";
+          token = '';
         }
-      } catch (e) {
-        errorEl.style.display = 'block';
-        errorEl.textContent = '❌ 网络错误：' + e.message;
+      } catch (err) {
+        loading.style.display = 'none';
+        showMessage('error', '❌ 网络错误：' + err.message);
         btn.disabled = false;
-        loadingEl.style.display = 'none';
-        btn.innerHTML = '<span>重新验证</span>';
-        
+        btn.textContent = '重新验证';
         initTurnstile();
-        token = "";
+        token = '';
       }
     }
 
-    // 键盘回车提交
-    document.addEventListener('keydown', function(e) {
+    function showMessage(type, text) {
+      const successEl = document.getElementById('success-msg');
+      const errorEl = document.getElementById('error-msg');
+      
+      if (type === 'success') {
+        successEl.textContent = text;
+        successEl.style.display = 'block';
+        errorEl.style.display = 'none';
+      } else {
+        errorEl.textContent = text;
+        errorEl.style.display = 'block';
+        successEl.style.display = 'none';
+      }
+    }
+
+    // 回车提交
+    document.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !document.getElementById('verify-btn').disabled) {
         submitVerify();
       }
@@ -1311,23 +1171,28 @@ function generateVerifyPage(siteKey, verifyId, userId) {
 </html>
   `;
 }
+
+// ---------------- Telegram API调用函数 ----------------
 async function tgApiCall(env, method, body) {
   try {
     const controller = new AbortController();
+    // 10秒超时
     setTimeout(() => controller.abort(), 10000);
 
     const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify(body),
       signal: controller.signal
     });
 
     const result = await res.json();
-    if (!result.ok) console.error(`[TG API失败] ${method}: ${result.description}`);
+    if (!result.ok) {
+      console.error(`[TG API错误] ${method} - 错误码:${result.error_code} 描述:${result.description}`);
+    }
     return result;
   } catch (error) {
-    console.error(`[TG API调用失败] ${method}: ${error.message}`);
-    return { ok: false, description: error.message };
+    console.error(`[TG API调用失败] ${method}:`, error.message);
+    return { ok: false, description: error.message, error_code: 500 };
   }
 }

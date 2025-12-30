@@ -3,7 +3,7 @@
  * 核心功能：
  * 1. 双向消息转发：用户私聊 ↔ 超级群组话题（文本/媒体）
  * 2. 编辑消息表情：🦄（1秒）→ 🕊，普通消息直接显示🕊
- * 3. 话题自动重建：检测到话题被删除时自动清理旧记录并重建（核心修复）
+ * 3. 话题自动重建：检测到话题被删除时自动清理旧记录并重建（修复重复创建问题）
  * 4. Turnstile验证：人机验证后才能发送消息
  * 5. 管理员指令：用户信息/验证重置/封禁/有效期设置等
  */
@@ -415,7 +415,7 @@ async function forwardUserMessageToGroup(msg, env, userName, userUsername, isEdi
     }
 
     const userId = msg.from.id;
-    // 获取/重建用户话题ID（核心修复：话题删除后自动重建）
+    // 获取/重建用户话题ID（核心修复：防止重复创建）
     const topicId = await getOrRecreateTopicId(userId, env, userName, userUsername);
     
     if (!topicId) {
@@ -660,60 +660,88 @@ async function handleUserMediaGroup(msg, env, topicId, isEdit = false, ctx) {
   }
 }
 
-// ---------------- 获取/重建用户话题（核心修复：删除后自动重建） ----------------
+// ---------------- 获取/重建用户话题（核心修复：防止重复创建） ----------------
 async function getOrRecreateTopicId(userId, env, userName, userUsername) {
   const topicKey = `user_topic:${userId}`;
+  const lockKey = `topic_lock:${userId}`; // 创建锁key
+  
+  // 1. 检查创建锁，防止并发重复创建
+  const isCreating = await env.TOPIC_MAP.get(lockKey).catch(() => null);
+  if (isCreating) {
+    // 等待锁释放（最多等3秒）
+    for (let i = 0; i < 3; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const newTopicId = await env.TOPIC_MAP.get(topicKey).catch(() => null);
+      if (newTopicId) return Number(newTopicId);
+    }
+  }
+
   let topicId = await env.TOPIC_MAP.get(topicKey).catch(() => null);
 
-  // 1. 有缓存的话题ID，先验证是否存在
+  // 2. 有缓存的话题ID，精准验证是否存在
   if (topicId) {
     topicId = Number(topicId);
-    // 验证话题是否存在（改用更可靠的getChatForumTopic接口）
     const checkResult = await tgApiCall(env, "getChatForumTopic", {
       chat_id: env.SUPERGROUP_ID,
       message_thread_id: topicId
-    }).catch(() => ({ ok: false }));
+    }).catch(() => ({ ok: false, error_code: 500 }));
     
-    // 话题存在，直接返回
-    if (checkResult.ok) {
-      return topicId;
+    // 仅当明确返回"话题不存在"时，才清理缓存重建
+    const isTopicNotFound = checkResult.error_code === 400 && 
+                           checkResult.description?.includes("THREAD_NOT_FOUND");
+    if (!isTopicNotFound) {
+      return topicId; // 话题存在 或 非话题不存在错误 → 直接返回
     }
     
-    // 话题不存在，清理旧缓存（含反向映射）
+    // 确认话题不存在，清理旧缓存
     console.warn(`[话题不存在] 用户ID:${userId} 旧话题ID:${topicId}，开始重建`);
     await env.TOPIC_MAP.delete(topicKey);
-    await env.TOPIC_MAP.delete(`topic_user:${topicId}`); // 清理旧反向映射
+    await env.TOPIC_MAP.delete(`topic_user:${topicId}`);
+    topicId = null; // 重置topicId，触发创建逻辑
   }
 
-  // 2. 创建新话题
-  userName = userName || (await getUserName(userId, env));
-  const topicName = userUsername ? `${userUsername}(${userId})` : `${userName}(${userId})`;
-  
-  const createResult = await tgApiCall(env, "createForumTopic", {
-    chat_id: env.SUPERGROUP_ID,
-    name: topicName,
-    icon_color: 0x6FB9F0 // 蓝色主题色
-  });
+  // 3. 无缓存/话题不存在，创建新话题（加锁防止重复）
+  if (!topicId) {
+    // 加创建锁（5秒过期，防止死锁）
+    await env.TOPIC_MAP.put(lockKey, "1", { expirationTtl: 5 });
+    
+    try {
+      userName = userName || (await getUserName(userId, env));
+      const topicName = userUsername ? `${userUsername}(${userId})` : `${userName}(${userId})`;
+      
+      const createResult = await tgApiCall(env, "createForumTopic", {
+        chat_id: env.SUPERGROUP_ID,
+        name: topicName,
+        icon_color: 0x6FB9F0 // 蓝色主题色
+      });
 
-  if (createResult.ok) {
-    const newTopicId = createResult.result.message_thread_id;
-    await env.TOPIC_MAP.put(topicKey, newTopicId.toString());
-    // 新增：建立话题ID→用户ID的反向映射（关键修复）
-    await env.TOPIC_MAP.put(`topic_user:${newTopicId}`, userId.toString());
+      if (createResult.ok) {
+        const newTopicId = createResult.result.message_thread_id;
+        // 缓存新话题ID（10分钟有效期，减少验证频率）
+        await env.TOPIC_MAP.put(topicKey, newTopicId.toString(), { expirationTtl: 600 });
+        // 建立反向映射
+        await env.TOPIC_MAP.put(`topic_user:${newTopicId}`, userId.toString());
 
-    // 首次创建话题，发送用户信息
-    await tgApiCall(env, "sendMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: newTopicId,
-      text: `📋 新用户会话\n├─ 昵称：${userName}\n├─ 用户名：${userUsername || "无"}\n└─ 用户ID：${userId}`,
-      parse_mode: "Markdown"
-    });
+        // 发送用户信息到新话题
+        await tgApiCall(env, "sendMessage", {
+          chat_id: env.SUPERGROUP_ID,
+          message_thread_id: newTopicId,
+          text: `📋 新用户会话\n├─ 昵称：${userName}\n├─ 用户名：${userUsername || "无"}\n└─ 用户ID：${userId}`,
+          parse_mode: "Markdown"
+        });
 
-    return newTopicId;
+        return newTopicId;
+      } else {
+        console.error(`[创建话题失败] 用户ID:${userId} 错误:${createResult.description}`);
+        return 0;
+      }
+    } finally {
+      // 释放创建锁
+      await env.TOPIC_MAP.delete(lockKey);
+    }
   }
 
-  console.error(`[创建话题失败] 用户ID:${userId} 错误:${createResult.description}`);
-  return 0;
+  return topicId || 0;
 }
 
 // ---------------- 辅助函数 ----------------
@@ -751,7 +779,7 @@ async function sendVerifyMessage(userId, env, msgId = null) {
   });
 }
 
-// ---------------- 修复：通过话题ID获取用户ID（优先反向映射） ----------------
+// ---------------- 通过话题ID获取用户ID（优先反向映射） ----------------
 async function getUserIdByTopicId(threadId, env) {
   // 优先读取反向映射（性能+准确性提升）
   const directUserId = await env.TOPIC_MAP.get(`topic_user:${threadId}`).catch(() => null);

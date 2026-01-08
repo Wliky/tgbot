@@ -50,6 +50,12 @@
 }
 ```
 ### 部署步骤
+## 一键部署
+点击下方按钮直接部署到 Cloudflare Workers
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yourusername/tgbot)
+
+## 手动部署
 1. 新建Cloudflare Worker，复制完整代码
 2. 配置上述环境变量
 3. 设置Telegram Webhook：`https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://<YOUR_WORKER_DOMAIN>`

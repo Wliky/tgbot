@@ -53,7 +53,7 @@
 ## 一键部署
 点击下方按钮直接部署到 Cloudflare Workers
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yourusername/tgbot)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Wliky/tgbot)
 
 ## 手动部署
 1. 新建Cloudflare Worker，复制完整代码
